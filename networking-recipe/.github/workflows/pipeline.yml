@@ -1,0 +1,200 @@
+name: "P4CP build checks"
+
+on:
+  push:
+    branches:
+      - main
+      - ipdk_v*
+      - mev-ts*
+
+  pull_request:
+    branches:
+      - main
+      - ipdk_v*
+      - mev-ts*
+
+concurrency:
+  # If workflow is currently running, stop it and start a new one.
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+env:
+  #---------------------------------------------------------------------
+  # Environment variables
+  #---------------------------------------------------------------------
+  SDE_REPOSITORY: ipdk-io/p4dev.dpdk-sde
+  SDE_TAG: 2023.10.1
+  SDE_FILENAME: dpdk-sde-dev-ubuntu-20.04.tar.gz
+  SDE_INSTALL_DIR: /opt/p4dev/dpdk-sde
+
+  DEPS_REPOSITORY: ipdk-io/stratum-deps
+  DEPS_TAG: v1.3.5
+  DEPS_FILENAME: deps-ubuntu-22.04-1.3.5-x86_64.tar.gz
+  DEPS_INSTALL_DIR: /opt/p4dev/x86deps
+
+  PREREQS: libbsd-dev libnl-3-dev libnl-route-3-dev libnl-genl-3-dev
+
+jobs:
+#---------------------------------------------------------------------
+# es2k_build_check
+#---------------------------------------------------------------------
+  es2k_build_check:
+    runs-on: [self-hosted, es2k-runner]
+    steps:
+      - name: List available runners
+        run: |
+          echo "Available runners:"
+          curl -s -H "Authorization: Bearer ${{ secrets.ORG_PAT }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/runners \
+            | jq '.runners?[]? | {name, status, labels}' || echo "No runners found."
+
+      - name: Log selected runner
+        run: |
+          echo "This job is running on runner: $RUNNER_NAME"
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install stratum dependencies
+        uses: robinraju/release-downloader@v1.12
+        with:
+          repository: ${{ env.DEPS_REPOSITORY }}
+          tag: ${{ env.DEPS_TAG }}
+          fileName: ${{ env.DEPS_FILENAME }}
+      - run: |
+          sudo tar -xzf $DEPS_FILENAME -C /
+          rm $DEPS_FILENAME
+
+      - name: Clone networking-recipe
+        run: |
+          echo "Cloning networking-recipe on runner..."
+          git clone https://x-access-token:${{ secrets.ORG_PAT }}@github.com/ipdk-io/networking-recipe.git --recursive
+
+      - name: Build project for ES2K target
+        working-directory: networking-recipe
+        run: |
+          echo "Building project for ES2K target..."
+          export DEPEND_INSTALL=$DEPS_INSTALL_DIR
+          export SDE_INSTALL=/opt/p4dev/es2k-sde
+          ./make-all.sh --target=es2k -D $DEPEND_INSTALL --rpath
+
+  #---------------------------------------------------------------------
+  # dpdk_build_and_test
+  #---------------------------------------------------------------------
+  dpdk_build_and_test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Clone networking-recipe
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          path: recipe
+
+      - name: Install prerequisites
+        run: |
+          sudo apt install $PREREQS
+
+      - name: Install DPDK SDE
+        uses: robinraju/release-downloader@v1.12
+        with:
+          repository: ${{ env.SDE_REPOSITORY }}
+          tag: ${{ env.SDE_TAG }}
+          fileName: ${{ env.SDE_FILENAME }}
+      - run: |
+          sudo tar -xzf $SDE_FILENAME -C /
+          rm $SDE_FILENAME
+
+      - name: Install stratum dependencies
+        uses: robinraju/release-downloader@v1.12
+        with:
+          repository: ${{ env.DEPS_REPOSITORY }}
+          tag: ${{ env.DEPS_TAG }}
+          fileName: ${{ env.DEPS_FILENAME }}
+      - run: |
+          sudo tar -xzf $DEPS_FILENAME -C /
+          rm $DEPS_FILENAME
+
+      - name: Build networking-recipe
+        working-directory: recipe
+        run: |
+          export DEPEND_INSTALL=$DEPS_INSTALL_DIR
+          export SDE_INSTALL=$SDE_INSTALL_DIR
+          ./make-all.sh --target=dpdk --rpath
+
+      - name: Run unit tests
+        working-directory: recipe/build
+        run: |
+          ctest --output-on-failure
+
+  #---------------------------------------------------------------------
+  # build_p4runtime_protos
+  #---------------------------------------------------------------------
+  build_p4runtime_protos:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Clone networking-recipe
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          path: recipe
+
+      - name: Install prerequisites
+        run: |
+          sudo apt install $PREREQS
+
+      - name: Install python dependencies
+        working-directory: recipe
+        run: |
+          python -m pip install setuptools build wheel
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v6.0.0
+        with:
+          go-version: 'stable'
+
+      - name: Install gRPC plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.28
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.2
+
+      - name: Install DPDK SDE
+        uses: robinraju/release-downloader@v1.12
+        with:
+          repository: ${{ env.SDE_REPOSITORY }}
+          tag: ${{ env.SDE_TAG }}
+          fileName: ${{ env.SDE_FILENAME }}
+      - run: |
+          sudo tar -xzf $SDE_FILENAME -C /
+          rm $SDE_FILENAME
+
+      - name: Install stratum dependencies
+        uses: robinraju/release-downloader@v1.12
+        with:
+          repository: ${{ env.DEPS_REPOSITORY }}
+          tag: ${{ env.DEPS_TAG }}
+          fileName: ${{ env.DEPS_FILENAME }}
+      - run: |
+          sudo tar -xzf $DEPS_FILENAME -C /
+          rm $DEPS_FILENAME
+
+      - name: Build protobufs in superproject
+        working-directory: recipe
+        run: |
+          export DEPEND_INSTALL=$DEPS_INSTALL_DIR
+          export SDE_INSTALL=$SDE_INSTALL_DIR
+          ./make-all.sh --target=dpdk --no-ovs --no-build
+          cmake --build build --target protobufs
+
+      - name: Build protobufs in subdirectory
+        working-directory: recipe/protobufs
+        run: |
+          export DEPEND_INSTALL=$DEPS_INSTALL_DIR
+          cmake -B build
+          cmake --build build
+          cmake --install build --prefix install
