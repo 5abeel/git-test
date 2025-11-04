@@ -1,0 +1,127 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main ]
+
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  # if workflow for PR or push is already running stop it, and start new one
+  group: build-and-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+
+  BuildAndTest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: "Set up Go"
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.24
+
+    - name: "Build DPDK"
+      run: make dpdk && sudo make install
+
+    - name: Change Permissions
+      run: |
+       sudo mkdir -p /var/lib/cni/inframanager
+       sudo chmod 777 -R /var/lib/cni/inframanager
+       ls -ltr /var/lib/cni
+
+    - name: "Test DPDK"
+      run: |
+        make test
+
+    - name: "Build ES2K"
+      run: make es2k && sudo make install
+    - name: "Test ES2K"
+      run: |
+        make test
+
+  lint_dockerfiles:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: 'Run hadolint - Manager-arm64'
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: 'images/Dockerfile.manager-arm64'
+          verbose: true
+
+      - name: 'Run hadolint - Manager'
+        if: always()
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: 'images/Dockerfile.manager'
+          verbose: true
+
+      - name: 'Run hadolint - Agent'
+        if: always()
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: 'images/Dockerfile.agent'
+          verbose: true
+
+  DockerBuildAndPush:
+    needs: [BuildAndTest, lint_dockerfiles]
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+
+    - uses: actions/checkout@v4
+
+    - name: "Set up Go"
+      uses: actions/setup-go@v5
+      with:
+        go-version: 1.24
+
+    - name: "Create k8s Kind Cluster"
+      uses: helm/kind-action@v1.12.0
+
+    - name: "kustomize test"
+      run: |
+        # https://github.com/kubernetes-sigs/kustomize/issues/2867
+        kustomize version
+
+    - name: "docker build"
+      run: make docker-build IMAGE_REGISTRY=ghcr.io/${{ github.repository_owner }}/k8s-infra-offload/ IMAGE_VERSION=sha-${GITHUB_SHA::7}
+
+    - name: "Docker build for branch"
+      if: github.event_name == 'push'
+      run: make docker-build IMAGE_REGISTRY=ghcr.io/${{ github.repository_owner }}/k8s-infra-offload/ IMAGE_VERSION=${GITHUB_REF##*/}
+
+    - name: "docker deploy"
+      run: |
+        make && make config
+        cp -f deploy/dpdk/infraagent-config.yaml deploy/.
+        make deploy IMAGE_REGISTRY=ghcr.io//${{ github.repository_owner }}k8s-infra-offload/ IMAGE_VERSION=sha-${GITHUB_SHA::7}
+        # getnodes using kubectl
+        kubectl get nodes -o wide
+        docker images | grep "k8s-infra-offload"
+
+    - name: "Login to GitHub Container Registry"
+      if: github.event_name == 'push'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: "push docker images to registry"
+      if: github.event_name == 'push'
+      run: |
+        make docker-push IMAGE_REGISTRY=ghcr.io/${{ github.repository_owner }}/k8s-infra-offload/ IMAGE_VERSION=sha-${GITHUB_SHA::7}
+        make docker-push IMAGE_REGISTRY=ghcr.io/${{ github.repository_owner }}/k8s-infra-offload/ IMAGE_VERSION=${GITHUB_REF##*/}
